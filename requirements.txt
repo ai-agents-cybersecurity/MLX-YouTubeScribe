@@ -12,3 +12,7 @@ pyyaml
 mlx-lm
 chromadb
 torch
+langgraph
+pyannote.audio>=3.1
+soundfile
+demucs
