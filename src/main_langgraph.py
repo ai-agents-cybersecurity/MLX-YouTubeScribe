@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+4#!/usr/bin/env python3
 
 # =========================================================================
 
@@ -21,6 +21,7 @@
 # [Apache License 2.0 details]
 
 import os
+import re
 import json
 import argparse
 import yt_dlp
@@ -96,9 +97,10 @@ class AudioTranscriber:
                 generated_ids = self.model.generate(
                     inputs.input_features,
                     attention_mask=inputs.attention_mask,
-                    return_timestamps=True,
+                    return_timestamps=False,
                     max_length=448,  # Limit output length
-                    language='en'  # Force English translation
+                    language='en',  # Force English language output
+                    task='transcribe'
                 )
 
             # Decode the output
@@ -114,6 +116,57 @@ class AudioTranscriber:
             return transcription
         except Exception as e:
             print(f"Error in transcription: {str(e)}")
+            return ""
+
+
+class VoxtralTranscriber:
+    """Audio transcription using Voxtral-Mini-3B via mlx-voxtral (Singleton Pattern)"""
+    _instance = None
+
+    def __init__(self):
+        from mlx_voxtral import VoxtralForConditionalGeneration, VoxtralProcessor
+        model_id = "mistralai/Voxtral-Mini-3B-2507"
+        print(f"Loading Voxtral model: {model_id}...")
+        self.model = VoxtralForConditionalGeneration.from_pretrained(model_id)
+        self.processor = VoxtralProcessor.from_pretrained(model_id)
+        print("Voxtral model loaded!")
+
+    @classmethod
+    def get_instance(cls):
+        """Get or create singleton instance"""
+        if cls._instance is None:
+            cls._instance = VoxtralTranscriber()
+        return cls._instance
+
+    @classmethod
+    def cleanup(cls):
+        """Clean up the singleton instance"""
+        if cls._instance is not None:
+            del cls._instance.model
+            del cls._instance.processor
+            cls._instance = None
+            gc.collect()
+
+    def transcribe(self, audio_path: str) -> str:
+        """Transcribe audio file using Voxtral"""
+        try:
+            inputs = self.processor.apply_transcrition_request(
+                audio=audio_path,
+                language="en"
+            )
+            outputs = self.model.generate(
+                input_ids=inputs.input_ids,
+                input_features=inputs.input_features,
+                max_new_tokens=4096,
+                temperature=0.0
+            )
+            transcript = self.processor.decode(
+                outputs[0][inputs.input_ids.shape[1]:],
+                skip_special_tokens=True
+            ).strip()
+            return transcript
+        except Exception as e:
+            print(f"Error in Voxtral transcription: {str(e)}")
             return ""
 
 
@@ -426,13 +479,77 @@ class DiarizerManager:
         return best_match
 
 
+def download_video(youtube_url: str, output_dir: str) -> Optional[str]:
+    """Download video in mp4 format using yt-dlp"""
+    try:
+        youtube_url = clean_video_url(youtube_url)
+        ydl_opts = {
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'merge_output_format': 'mp4',
+            'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
+            'quiet': False,
+            'no_warnings': False,
+        }
+        os.makedirs(output_dir, exist_ok=True)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=True)
+        if not info:
+            print("Failed to download video.")
+            return None
+        title = sanitize_title(info.get('title', ''))
+        expected_mp4 = os.path.join(output_dir, f"{title}.mp4")
+        if os.path.exists(expected_mp4):
+            return expected_mp4
+        # Fallback: search for any mp4 file
+        for file in os.listdir(output_dir):
+            if file.endswith('.mp4'):
+                mp4_file = os.path.join(output_dir, file)
+                print(f"Found video file: {mp4_file}")
+                return mp4_file
+        print(f"No mp4 file found in {output_dir}.")
+        return None
+    except Exception as e:
+        print(f"Error downloading video: {str(e)}")
+        return None
+
+
 def clean_video_url(url: str) -> str:
-    """Remove playlist parameters from a video URL to get just the single video"""
-    if 'watch?v=' in url and '&' in url:
-        # Extract video ID and rebuild clean URL
-        video_id = url.split('watch?v=')[1].split('&')[0]
-        return f'https://www.youtube.com/watch?v={video_id}'
+    """Normalize a YouTube URL to a clean watch?v= format.
+    Handles Shorts URLs, mobile URLs, and removes playlist parameters."""
+    # Extract video ID from various YouTube URL formats
+    patterns = [
+        r'(?:youtube\.com/shorts/)([a-zA-Z0-9_-]{11})',       # Shorts
+        r'(?:youtube\.com/watch\?v=)([a-zA-Z0-9_-]{11})',     # Standard watch
+        r'(?:youtu\.be/)([a-zA-Z0-9_-]{11})',                 # Short share URL
+        r'(?:youtube\.com/embed/)([a-zA-Z0-9_-]{11})',        # Embed
+        r'(?:youtube\.com/v/)([a-zA-Z0-9_-]{11})',            # Old embed
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return f'https://www.youtube.com/watch?v={match.group(1)}'
     return url
+
+
+def sanitize_title(title: str) -> str:
+    """Sanitize a video title to match yt-dlp's filename sanitization.
+    yt-dlp replaces certain characters with fullwidth Unicode equivalents."""
+    # yt-dlp fullwidth character replacements (from yt_dlp.utils.sanitize_filename)
+    _FULLWIDTH_MAP = {
+        '"': '\uff02',   # ＂
+        '*': '\uff0a',   # ＊
+        '/': '\uff0f',   # ／
+        ':': '\uff1a',   # ：
+        '<': '\uff1c',   # ＜
+        '>': '\uff1e',   # ＞
+        '?': '\uff1f',   # ？
+        '\\': '\uff3c',  # ＼
+        '|': '\uff5c',   # ｜
+    }
+    sanitized = title
+    for char, replacement in _FULLWIDTH_MAP.items():
+        sanitized = sanitized.replace(char, replacement)
+    return sanitized
 
 def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[dict], Optional[str]]:
     """Get video information and download audio using yt-dlp"""
@@ -458,21 +575,17 @@ def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[d
             # Use sanitized title for output filename
             ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
 
-            # First get info without downloading
-            with yt_dlp.YoutubeDL({**ydl_opts, 'extract_flat': True}) as ydl:
-                info = ydl.extract_info(youtube_url, download=False)
+            # Download once and return metadata from the same request
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
 
             if not info:
                 print("Failed to extract video info.")
                 return None, None
 
-            # Sanitize title for filename
-            title = info.get('title', '').replace('/', '_').replace(':', '_').replace('?', '_').replace('|', '_')
+            # Sanitize title the same way yt-dlp does for filenames
+            title = sanitize_title(info.get('title', ''))
             expected_wav = os.path.join(output_dir, f"{title}.wav")
-
-            # Now download with the same options
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([youtube_url])
 
             if os.path.exists(expected_wav):
                 return info, expected_wav
@@ -805,6 +918,7 @@ class State(TypedDict):
     url: str
     is_playlist: bool
     audio_only: bool  # If True, skip transcription
+    save_video: bool  # If True, also download video as mp4
     playlist_info: Optional[dict]
     output_dir: str
     video_urls: List[Tuple[str, str]]  # (url, title)
@@ -812,8 +926,10 @@ class State(TypedDict):
     current_video_url: Optional[str]
     current_video_title: Optional[str]
     audio_dir: Optional[str]
+    video_dir: Optional[str]
     video_info: Optional[dict]
     audio_path: Optional[str]
+    video_path: Optional[str]
     audio_analysis: Optional[str]
     audio_metrics: Optional[dict]
     audio_features: Optional[List[mx.array]]
@@ -824,6 +940,7 @@ class State(TypedDict):
     pascal_speaker_id: Optional[str]  # Which speaker ID is Pascal
     reference_audio_path: Optional[str]  # Path to Pascal reference clip
     pascal_segments: Optional[List[dict]]  # Pascal's segments with transcripts for TTS
+    transcription_backend: Optional[str]  # "whisper" or "voxtral"
 
 def extract_radio_mix_videos(url: str) -> list:
     """Extract videos from a Radio/Mix by using yt-dlp with the watch URL"""
@@ -921,12 +1038,17 @@ def set_current(state: State) -> dict:
     url, title = urls[index]
     audio_dir = os.path.join(state["output_dir"], 'audio')
     os.makedirs(audio_dir, exist_ok=True)
+    video_dir = os.path.join(state["output_dir"], 'video') if state.get("save_video") else None
+    if video_dir:
+        os.makedirs(video_dir, exist_ok=True)
     return {
         "current_video_url": url,
         "current_video_title": title,
         "audio_dir": audio_dir,
+        "video_dir": video_dir,
         "video_info": None,
         "audio_path": None,
+        "video_path": None,
         "audio_analysis": None,
         "audio_metrics": None,
         "audio_features": None,
@@ -947,8 +1069,8 @@ def check_already_processed(state: State) -> dict:
         # Can't check without title, proceed with processing
         return {}
     
-    # Sanitize title the same way save_node does
-    title = state["current_video_title"].replace('/', '_').replace(':', '_').replace('?', '_').replace('|', '_')
+    # Sanitize title the same way yt-dlp and save_node do
+    title = sanitize_title(state["current_video_title"])
     json_path = os.path.join(state["output_dir"], f"{title}.json")
     txt_path = os.path.join(state["output_dir"], f"{title}.txt")
     
@@ -966,12 +1088,21 @@ def get_video_info_node(state: State) -> dict:
     info, audio_path = get_video_info(state["current_video_url"], state["audio_dir"])
     if not info or not audio_path:
         print("✗ Error processing video: Could not fetch video information and audio")
-        return {"video_info": None, "audio_path": None, "transcript": None}  # Set all to None for error handling
+        return {"video_info": None, "audio_path": None, "video_path": None, "transcript": None}
+    # Download video mp4 if requested
+    video_path = None
+    if state.get("save_video") and state.get("video_dir"):
+        print("\nDownloading video (mp4)...")
+        video_path = download_video(state["current_video_url"], state["video_dir"])
+        if video_path:
+            print(f"✓ Video saved: {video_path}")
+        else:
+            print("⚠ Video download failed, continuing with audio only")
     if not state.get("audio_only"):
         print("\nGenerating transcript...")
     else:
         print("\n✓ Audio downloaded successfully")
-    return {"video_info": info, "audio_path": audio_path}
+    return {"video_info": info, "audio_path": audio_path, "video_path": video_path}
 
 def process_audio_analysis_node(state: State) -> dict:
     if not state["audio_path"]:
@@ -1063,7 +1194,18 @@ def diarize_node(state: State) -> dict:
 
 def transcribe_node(state: State) -> dict:
     """Transcribe audio - either full or Pascal-only segments"""
-    if not state["audio_features"]:
+    backend = state.get("transcription_backend") or "whisper"
+
+    # Voxtral backend: takes audio file path directly, no chunking needed
+    if backend == "voxtral":
+        if not state.get("audio_path"):
+            return {"transcript": None}
+        print("\nTranscribing with Voxtral-Mini-3B...")
+        transcript = VoxtralTranscriber.get_instance().transcribe(state["audio_path"])
+        return {"transcript": transcript}
+
+    # Whisper backend (default)
+    if not state.get("audio_features"):
         return {"transcript": None, "pascal_segments": state.get("pascal_segments")}
 
     # Check if we have Pascal segments to transcribe individually
@@ -1176,7 +1318,7 @@ def save_node(state: State) -> dict:
 
         return {"current_index": state["current_index"] + 1, "video_transcripts": []}
 
-    title = state["video_info"].get('title', '').replace('/', '_').replace(':', '_').replace('?', '_').replace('|', '_')
+    title = sanitize_title(state["video_info"].get('title', ''))
     description = state["video_info"].get('description', '')
     duration = state["video_info"].get('duration', 0)
     view_count = state["video_info"].get('view_count', 0)
@@ -1198,7 +1340,8 @@ def save_node(state: State) -> dict:
         'audio_analysis': state.get("audio_analysis"),
         'transcript': state.get("transcript"),
         'audio_file': os.path.basename(state["audio_path"]) if state.get("audio_path") else None,
-        'mode': 'audio_only' if state.get("audio_only") else 'full'
+        'video_file': os.path.basename(state["video_path"]) if state.get("video_path") else None,
+        'mode': 'audio_only' if state.get("audio_only") else ('voxtral' if state.get("transcription_backend") == "voxtral" else 'full')
     }
 
     # Add diarization info if available
@@ -1233,7 +1376,10 @@ def save_node(state: State) -> dict:
         f.write(f"Duration: {duration} seconds\n")
         f.write(f"Views: {view_count}\n")
         f.write(f"Description: {description}\n")
-        f.write(f"Audio File: {os.path.basename(state['audio_path'])}\n\n")
+        f.write(f"Audio File: {os.path.basename(state['audio_path'])}\n")
+        if state.get("video_path"):
+            f.write(f"Video File: {os.path.basename(state['video_path'])}\n")
+        f.write("\n")
 
         if has_diarization:
             f.write("Diarization Info:\n")
@@ -1320,8 +1466,9 @@ def finalize_node(state: State) -> dict:
         print(f"  Total duration: {total_duration:.1f} seconds ({total_duration/60:.1f} minutes)")
         print(f"  Output: {state['output_dir']}/segments/")
 
-    # Clean up transcriber singleton at the end
+    # Clean up transcriber singletons at the end
     AudioTranscriber.cleanup()
+    VoxtralTranscriber.cleanup()
     # Clean up diarizer singleton
     DiarizerManager.cleanup()
     DemucsManager.cleanup()
@@ -1371,7 +1518,14 @@ def audio_only_condition(state: State):
     return "transcribe"
 
 graph.add_conditional_edges("get_video_info", audio_only_condition, {"transcribe": "process_analysis", "audio_only": "save"})
-graph.add_edge("process_analysis", "process_features")
+
+# Conditional edge: voxtral skips feature extraction and diarization
+def backend_condition(state: State):
+    if state.get("transcription_backend") == "voxtral":
+        return "voxtral"
+    return "whisper"
+
+graph.add_conditional_edges("process_analysis", backend_condition, {"whisper": "process_features", "voxtral": "transcribe"})
 graph.add_edge("process_features", "diarize")
 graph.add_edge("diarize", "transcribe")
 graph.add_edge("transcribe", "save")
@@ -1393,11 +1547,15 @@ Examples:
   python main_langgraph.py -u "https://youtube.com/..." -m 1  # Audio only
   python main_langgraph.py -u "https://youtube.com/..." -m 2  # Audio + Transcription
   python main_langgraph.py -u "https://youtube.com/..." -m 3  # Speaker diarization + TTS
+  python main_langgraph.py -u "https://youtube.com/..." -m 4  # Audio + Voxtral transcription
+  python main_langgraph.py -u "https://youtube.com/..." -m 2 --save-video  # Transcription + save mp4
         '''
     )
     parser.add_argument('-u', '--url', type=str, help='YouTube URL or Playlist URL')
-    parser.add_argument('-m', '--mode', type=str, choices=['1', '2', '3'],
-                        help='Mode: 1=Audio only, 2=Audio+Transcription, 3=Speaker diarization+TTS')
+    parser.add_argument('-m', '--mode', type=str, choices=['1', '2', '3', '4'],
+                        help='Mode: 1=Audio only, 2=Audio+Transcription, 3=Speaker diarization+TTS, 4=Audio+Voxtral')
+    parser.add_argument('--save-video', action='store_true',
+                        help='Also save the video file in mp4 format')
     args = parser.parse_args()
 
     # Get URL from args or prompt
@@ -1410,13 +1568,26 @@ Examples:
     if args.mode:
         mode = args.mode
     else:
-        mode = input('Mode - (1) Audio only  (2) Audio + Transcription  (3) Speaker diarization + TTS segments [default: 2]: ').strip()
+        mode = input('Mode - (1) Audio only  (2) Audio + Transcription  (3) Speaker diarization + TTS  (4) Audio + Voxtral [default: 2]: ').strip()
 
     audio_only = mode == '1'
     diarization_mode = mode == '3'
+    voxtral_mode = mode == '4'
+    transcription_backend = "voxtral" if voxtral_mode else "whisper"
+
+    # Determine whether to save video
+    if args.save_video:
+        save_video = True
+    else:
+        save_video_input = input('Save video file (.mp4)? (y/n) [default: n]: ').strip().lower()
+        save_video = save_video_input in ('y', 'yes')
 
     if audio_only:
         print("Audio-only mode: will download audio without transcription")
+    elif voxtral_mode:
+        print("Voxtral mode: will transcribe using Voxtral-Mini-3B-2507")
+    if save_video:
+        print("Video save enabled: will also download video as mp4")
 
     # Ask for reference audio if in diarization mode
     reference_audio_path = None
@@ -1452,6 +1623,7 @@ Examples:
         "url": url,
         "is_playlist": False,
         "audio_only": audio_only,
+        "save_video": save_video,
         "playlist_info": None,
         "output_dir": "",
         "video_urls": [],
@@ -1459,8 +1631,10 @@ Examples:
         "current_video_url": None,
         "current_video_title": None,
         "audio_dir": None,
+        "video_dir": None,
         "video_info": None,
         "audio_path": None,
+        "video_path": None,
         "audio_analysis": None,
         "audio_metrics": None,
         "audio_features": None,
@@ -1470,7 +1644,8 @@ Examples:
         "diarization_segments": None,
         "pascal_speaker_id": None,
         "reference_audio_path": reference_audio_path,
-        "pascal_segments": None
+        "pascal_segments": None,
+        "transcription_backend": transcription_backend
     }
     # Set recursion limit high enough for large playlists (72 videos × ~8 steps = ~600)
     app.invoke(initial_state, {"recursion_limit": 1000})

@@ -16,3 +16,4 @@ langgraph
 pyannote.audio>=3.1
 soundfile
 demucs
+mlx-voxtral

@@ -1,6 +1,8 @@
 # User specified
 .claude
 output/
+oldoutput/
+src/utils/
 CLAUDE.md
 token.md
 yt.md
