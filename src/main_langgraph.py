@@ -24,6 +24,7 @@ import os
 import re
 import json
 import argparse
+import subprocess
 import yt_dlp
 import numpy as np
 import mlx.core as mx
@@ -484,11 +485,13 @@ def download_video(youtube_url: str, output_dir: str) -> Optional[str]:
     try:
         youtube_url = clean_video_url(youtube_url)
         ydl_opts = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
             'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
             'quiet': False,
             'no_warnings': False,
+            'cookiesfrombrowser': ('chrome',),
+            'remote_components': ['ejs:github'],
         }
         os.makedirs(output_dir, exist_ok=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -551,14 +554,97 @@ def sanitize_title(title: str) -> str:
         sanitized = sanitized.replace(char, replacement)
     return sanitized
 
+# Supported local video extensions
+LOCAL_VIDEO_EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv', '.m4v', '.wmv'}
+
+def is_local_path(input_str: str) -> bool:
+    """Check if the input string is a local file or directory path rather than a URL"""
+    return os.path.exists(input_str)
+
+def get_local_video_files(path: str) -> List[str]:
+    """Get list of video files from a path (single file or directory)"""
+    if os.path.isfile(path):
+        ext = os.path.splitext(path)[1].lower()
+        if ext in LOCAL_VIDEO_EXTENSIONS:
+            return [os.path.abspath(path)]
+        else:
+            print(f"Warning: '{path}' is not a supported video format. Supported: {', '.join(sorted(LOCAL_VIDEO_EXTENSIONS))}")
+            return []
+    elif os.path.isdir(path):
+        files = []
+        for f in sorted(os.listdir(path)):
+            ext = os.path.splitext(f)[1].lower()
+            if ext in LOCAL_VIDEO_EXTENSIONS:
+                files.append(os.path.abspath(os.path.join(path, f)))
+        return files
+    return []
+
+def extract_audio_from_local_file(video_path: str, output_dir: str) -> Tuple[Optional[dict], Optional[str]]:
+    """Extract audio from a local video file using ffmpeg, returning (info_dict, wav_path)"""
+    try:
+        video_path = os.path.abspath(video_path)
+        basename = os.path.splitext(os.path.basename(video_path))[0]
+        os.makedirs(output_dir, exist_ok=True)
+        wav_path = os.path.join(output_dir, f"{basename}.wav")
+
+        # Get duration and check for audio streams using ffprobe
+        duration = 0
+        has_audio = False
+        try:
+            probe_result = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', video_path],
+                capture_output=True, text=True
+            )
+            if probe_result.returncode == 0:
+                probe_data = json.loads(probe_result.stdout)
+                duration = int(float(probe_data.get('format', {}).get('duration', 0)))
+                for stream in probe_data.get('streams', []):
+                    if stream.get('codec_type') == 'audio':
+                        has_audio = True
+                        break
+        except Exception:
+            pass
+
+        if not has_audio:
+            print(f"⚠ Skipping '{os.path.basename(video_path)}': no audio stream found (video-only file)")
+            return None, None
+
+        # Extract audio to WAV using ffmpeg
+        print(f"Extracting audio from: {os.path.basename(video_path)}")
+        result = subprocess.run(
+            ['ffmpeg', '-y', '-i', video_path, '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', wav_path],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"ffmpeg error: {result.stderr}")
+            return None, None
+
+        if not os.path.exists(wav_path):
+            print(f"Error: WAV file was not created at {wav_path}")
+            return None, None
+
+        # Build a metadata dict compatible with yt-dlp info format
+        info = {
+            'title': basename,
+            'description': f'Local file: {video_path}',
+            'duration': duration,
+            'view_count': 0,
+        }
+        return info, wav_path
+
+    except Exception as e:
+        print(f"Error extracting audio from local file: {str(e)}")
+        return None, None
+
 def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[dict], Optional[str]]:
     """Get video information and download audio using yt-dlp"""
     try:
         # Clean URL to remove playlist parameters for single video downloads
         youtube_url = clean_video_url(youtube_url)
         # Configure yt-dlp options for highest quality audio
+        # Uses Safari cookies for YouTube Premium (256kbps AAC) when available
         ydl_opts = {
-            'format': 'bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio/best',
+            'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'wav',
@@ -566,7 +652,8 @@ def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[d
             }],
             'quiet': False,
             'no_warnings': False,
-            'prefer_free_formats': True,  # Prefer open formats like opus
+            'cookiesfrombrowser': ('chrome',),
+            'remote_components': ['ejs:github'],
         }
 
         # If output_dir is provided, save WAV there, otherwise use temp file
@@ -909,7 +996,9 @@ def extract_playlist_info(playlist_url: str) -> dict:
     ydl_opts = {
         'quiet': True,
         'extract_flat': True,
-        'no_warnings': True
+        'no_warnings': True,
+        'cookiesfrombrowser': ('chrome',),
+        'remote_components': ['ejs:github'],
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(playlist_url, download=False)
@@ -919,6 +1008,7 @@ class State(TypedDict):
     is_playlist: bool
     audio_only: bool  # If True, skip transcription
     save_video: bool  # If True, also download video as mp4
+    is_local_file: bool  # If True, input is a local video file/folder
     playlist_info: Optional[dict]
     output_dir: str
     video_urls: List[Tuple[str, str]]  # (url, title)
@@ -949,6 +1039,8 @@ def extract_radio_mix_videos(url: str) -> list:
         'extract_flat': 'in_playlist',
         'no_warnings': True,
         'noplaylist': False,  # Allow playlist extraction
+        'cookiesfrombrowser': ('chrome',),
+        'remote_components': ['ejs:github'],
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -962,6 +1054,40 @@ def extract_radio_mix_videos(url: str) -> list:
 
 def start_node(state: State) -> dict:
     url = state["url"]
+
+    # Handle local file/folder input
+    if state.get("is_local_file") and is_local_path(url):
+        video_files = get_local_video_files(url)
+        if not video_files:
+            raise ValueError(f"No supported video files found at: {url}")
+
+        is_batch = len(video_files) > 1
+        if os.path.isdir(url):
+            folder_name = os.path.basename(os.path.abspath(url))
+            output_dir = os.path.join('output', folder_name)
+        else:
+            output_dir = 'output'
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Build video_urls list as (file_path, title) tuples
+        video_urls = [(f, os.path.splitext(os.path.basename(f))[0]) for f in video_files]
+
+        if is_batch:
+            print(f"\nProcessing {len(video_files)} local video files from: {url}")
+            print("-" * 50)
+            for i, (_, title) in enumerate(video_urls, 1):
+                print(f"  {i}. {title}")
+            print("-" * 50 + "\n")
+
+        return {
+            "is_playlist": is_batch,
+            "is_local_file": True,
+            "playlist_info": None,
+            "video_urls": video_urls,
+            "output_dir": output_dir,
+            "current_index": 0
+        }
+
     # Check for force_playlist marker
     force_playlist = '__force_playlist=1' in url
     url = url.replace('&__force_playlist=1', '')  # Clean the marker
@@ -1085,6 +1211,20 @@ def check_already_processed(state: State) -> dict:
     return {}
 
 def get_video_info_node(state: State) -> dict:
+    # Local file: extract audio with ffmpeg instead of yt-dlp
+    if state.get("is_local_file"):
+        info, audio_path = extract_audio_from_local_file(state["current_video_url"], state["audio_dir"])
+        if not info or not audio_path:
+            print("✗ Error processing local file: Could not extract audio")
+            return {"video_info": None, "audio_path": None, "video_path": None, "transcript": None}
+        # For local files, the original video file IS the video_path
+        video_path = state["current_video_url"] if state.get("save_video") else None
+        if not state.get("audio_only"):
+            print("\nGenerating transcript...")
+        else:
+            print("\n✓ Audio extracted successfully")
+        return {"video_info": info, "audio_path": audio_path, "video_path": video_path}
+
     info, audio_path = get_video_info(state["current_video_url"], state["audio_dir"])
     if not info or not audio_path:
         print("✗ Error processing video: Could not fetch video information and audio")
@@ -1329,14 +1469,19 @@ def save_node(state: State) -> dict:
     pascal_id = state.get("pascal_speaker_id")
     has_diarization = pascal_segments and diarization_segments and pascal_id
 
-    output_data = {
-        'video_info': {
+    video_info_data = {
             'title': title,
             'description': description,
             'duration': duration,
             'view_count': view_count,
-            'url': state["current_video_url"]
-        },
+    }
+    if state.get("is_local_file"):
+        video_info_data['source'] = state["current_video_url"]
+    else:
+        video_info_data['url'] = state["current_video_url"]
+
+    output_data = {
+        'video_info': video_info_data,
         'audio_analysis': state.get("audio_analysis"),
         'transcript': state.get("transcript"),
         'audio_file': os.path.basename(state["audio_path"]) if state.get("audio_path") else None,
@@ -1371,7 +1516,10 @@ def save_node(state: State) -> dict:
 
         f.write("Video Information:\n")
         f.write("-" * 20 + "\n")
-        f.write(f"URL: {state['current_video_url']}\n")
+        if state.get("is_local_file"):
+            f.write(f"Source: {state['current_video_url']}\n")
+        else:
+            f.write(f"URL: {state['current_video_url']}\n")
         f.write(f"Title: {title}\n")
         f.write(f"Duration: {duration} seconds\n")
         f.write(f"Views: {view_count}\n")
@@ -1434,7 +1582,10 @@ def save_node(state: State) -> dict:
 
         print(f"✓ Saved {len(pascal_segments)} TTS training segments")
 
-    transcript_dict = {"url": state["current_video_url"], "title": title, "transcript": state["transcript"]}
+    if state.get("is_local_file"):
+        transcript_dict = {"source": state["current_video_url"], "title": title, "transcript": state["transcript"]}
+    else:
+        transcript_dict = {"url": state["current_video_url"], "title": title, "transcript": state["transcript"]}
 
     if state["is_playlist"]:
         if state["transcript"]:
@@ -1538,7 +1689,7 @@ app = graph.compile()
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate transcripts from YouTube videos using local Whisper models',
+        description='Generate transcripts from YouTube videos or local video files using local Whisper models',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -1549,9 +1700,13 @@ Examples:
   python main_langgraph.py -u "https://youtube.com/..." -m 3  # Speaker diarization + TTS
   python main_langgraph.py -u "https://youtube.com/..." -m 4  # Audio + Voxtral transcription
   python main_langgraph.py -u "https://youtube.com/..." -m 2 --save-video  # Transcription + save mp4
+  python main_langgraph.py -f /path/to/video.mp4 -m 2       # Local video file
+  python main_langgraph.py -d /path/to/videos/ -m 2         # All videos in a folder
         '''
     )
     parser.add_argument('-u', '--url', type=str, help='YouTube URL or Playlist URL')
+    parser.add_argument('-f', '--file', type=str, help='Local video file path (.mp4, .mov, .mkv, etc.)')
+    parser.add_argument('-d', '--dir', type=str, help='Directory of local video files to batch process')
     parser.add_argument('-m', '--mode', type=str, choices=['1', '2', '3', '4'],
                         help='Mode: 1=Audio only, 2=Audio+Transcription, 3=Speaker diarization+TTS, 4=Audio+Voxtral')
     parser.add_argument('--save-video', action='store_true',
@@ -1559,10 +1714,38 @@ Examples:
     args = parser.parse_args()
 
     # Get URL from args or prompt
-    if args.url:
+    is_local = False
+    if args.file:
+        url = os.path.abspath(args.file)
+        is_local = True
+        if not os.path.isfile(url):
+            print(f"Error: File not found: {url}")
+            return
+        ext = os.path.splitext(url)[1].lower()
+        if ext not in LOCAL_VIDEO_EXTENSIONS:
+            print(f"Error: Unsupported format '{ext}'. Supported: {', '.join(sorted(LOCAL_VIDEO_EXTENSIONS))}")
+            return
+        print(f"Local video file: {url}")
+    elif args.dir:
+        url = os.path.abspath(args.dir)
+        is_local = True
+        if not os.path.isdir(url):
+            print(f"Error: Directory not found: {url}")
+            return
+        files = get_local_video_files(url)
+        if not files:
+            print(f"Error: No supported video files found in: {url}")
+            return
+        print(f"Found {len(files)} video file(s) in: {url}")
+    elif args.url:
         url = args.url
     else:
-        url = input('Enter YouTube URL or Playlist URL: ')
+        url = input('Enter YouTube URL, Playlist URL, or local file/folder path: ')
+        # Auto-detect local paths
+        if os.path.exists(url):
+            url = os.path.abspath(url)
+            is_local = True
+            print(f"Detected local path: {url}")
 
     # Get mode from args or prompt
     if args.mode:
@@ -1607,7 +1790,7 @@ Examples:
 
     # Check if it's a Radio/Mix URL and ask user preference
     force_playlist = False
-    if is_radio_mix_url(url):
+    if not is_local and is_radio_mix_url(url):
         choice = input('Radio/Mix playlist detected. Download all videos? (y/n): ').strip().lower()
         force_playlist = choice in ('y', 'yes')
         if force_playlist:
@@ -1624,6 +1807,7 @@ Examples:
         "is_playlist": False,
         "audio_only": audio_only,
         "save_video": save_video,
+        "is_local_file": is_local,
         "playlist_info": None,
         "output_dir": "",
         "video_urls": [],
