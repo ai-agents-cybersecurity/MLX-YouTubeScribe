@@ -42,3 +42,7 @@ ENV/
 .idea/
 *.swp
 .DS_Store
+
+# Audio files
+*.wav
+*.mp3
