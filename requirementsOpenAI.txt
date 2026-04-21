@@ -1,0 +1,6 @@
+python-dotenv
+openai
+yt-dlp
+numpy
+scipy
+langgraph

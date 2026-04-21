@@ -1,0 +1,16 @@
+# NVIDIA DGX Spark (GB10 Grace Blackwell, aarch64, CUDA 13.x)
+# Install inside the `dgx-mac` conda env (already has torch 2.11.0+cu130).
+#
+# System prerequisites:
+#   sudo apt-get install -y ffmpeg
+#
+# Backend: HF transformers ASR pipeline on CUDA. Avoids CTranslate2 (no
+# CUDA wheels on aarch64) and NeMo. Works with the preinstalled torch.
+
+transformers>=4.45
+accelerate>=0.33
+librosa>=0.10
+soundfile>=0.12
+yt-dlp>=2024.12.0
+langgraph>=0.2
+numpy
