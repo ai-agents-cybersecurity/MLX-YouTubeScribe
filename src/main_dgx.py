@@ -106,10 +106,13 @@ class WhisperTranscriber:
                 **gen_kwargs,
             )
 
-        decoded = self.processor.batch_decode(
-            output, skip_special_tokens=True, output_offsets=True
+        # output is (1, seq_len); decode the single sequence so `text` is a
+        # string and `offsets` is a flat list. Passing the 2D tensor to
+        # batch_decode in transformers >=5 returns a dict with list-valued text.
+        sequences = output[0] if output.ndim > 1 else output
+        result = self.processor.tokenizer.decode(
+            sequences, skip_special_tokens=True, output_offsets=True
         )
-        result = decoded[0] if decoded else {"text": "", "offsets": []}
 
         text = (result.get("text") or "").strip()
         segments: List[dict] = []
