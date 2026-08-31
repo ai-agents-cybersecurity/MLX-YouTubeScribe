@@ -2,6 +2,7 @@ python-dotenv
 langchain
 youtube_transcript_api
 mlx
+mlx-whisper
 mlx-audio
 yt-dlp
 numpy

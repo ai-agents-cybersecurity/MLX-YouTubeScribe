@@ -42,3 +42,11 @@ ENV/
 .idea/
 *.swp
 .DS_Store
+
+# Generated media (never commit audio/video)
+*.wav
+*.mp3
+*.m4a
+*.mp4
+*.webm
+audio/

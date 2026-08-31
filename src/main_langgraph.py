@@ -27,97 +27,23 @@ import argparse
 import subprocess
 import yt_dlp
 import numpy as np
-import mlx.core as mx
-import mlx.nn as nn
 from typing import Any, List, Tuple, Dict, Optional, TypedDict, Annotated
 from scipy.io import wavfile
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
 from dataclasses import dataclass
 import torch
 from langgraph.graph import StateGraph, END
 import operator
 import gc
 
-modelo1 = "openai/whisper-large-v3-turbo"
-modelo2 = "openai/whisper-tiny.en"
-
-@dataclass
-class AudioTranscriber:
-    """Audio transcription using Whisper (Singleton Pattern)"""
-    processor: WhisperProcessor
-    model: WhisperForConditionalGeneration
-    _instance = None
-
-    def __init__(self):
-        # Initialize with English-only model
-        self.processor = WhisperProcessor.from_pretrained(modelo1)
-        self.model = WhisperForConditionalGeneration.from_pretrained(
-            modelo1,
-            torch_dtype=torch.float32  # Use float32 to match input dtype
-        )
-    
-    @classmethod
-    def get_instance(cls):
-        """Get or create singleton instance"""
-        if cls._instance is None:
-            cls._instance = AudioTranscriber()
-        return cls._instance
-    
-    @classmethod
-    def cleanup(cls):
-        """Clean up the singleton instance"""
-        if cls._instance is not None:
-            # Clear model from memory
-            del cls._instance.model
-            del cls._instance.processor
-            cls._instance = None
-            # Force garbage collection
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-    def transcribe(self, audio_features: mx.array) -> str:
-        """Transcribe audio using Whisper"""
-        try:
-            # Convert MLX array to numpy for processing
-            audio_np = audio_features.tolist()
-            if isinstance(audio_np, list):
-                audio_np = np.array(audio_np)
-
-            # Process audio features
-            inputs = self.processor(
-                audio_np,
-                return_tensors="pt",
-                sampling_rate=16000,
-                return_attention_mask=True,
-                language="en"  # Explicitly set English as target language
-            )
-
-            # Generate transcription using PyTorch
-            with torch.no_grad():
-                generated_ids = self.model.generate(
-                    inputs.input_features,
-                    attention_mask=inputs.attention_mask,
-                    return_timestamps=False,
-                    max_length=448,  # Limit output length
-                    language='en',  # Force English language output
-                    task='transcribe'
-                )
-
-            # Decode the output
-            transcription = self.processor.batch_decode(
-                generated_ids,
-                skip_special_tokens=True
-            )[0].strip()
-
-            # Clean up intermediate tensors
-            del audio_np, inputs, generated_ids
-            gc.collect()
-
-            return transcription
-        except Exception as e:
-            print(f"Error in transcription: {str(e)}")
-            return ""
+from filename_utils import (
+    find_existing_transcript,
+    quarantine_output_files,
+    recursion_limit_for,
+    resolve_downloaded_media,
+    sanitize_title,
+    transcript_audio_matches,
+)
+from whisper_mlx import AudioTranscriber, SAMPLE_RATE as WHISPER_SAMPLE_RATE
 
 
 class VoxtralTranscriber:
@@ -480,10 +406,16 @@ class DiarizerManager:
         return best_match
 
 
-def download_video(youtube_url: str, output_dir: str) -> Optional[str]:
+def download_video(youtube_url: str, output_dir: str, info: Optional[dict] = None) -> Optional[str]:
     """Download video in mp4 format using yt-dlp"""
     try:
         youtube_url = clean_video_url(youtube_url)
+        os.makedirs(output_dir, exist_ok=True)
+        if info:
+            existing = resolve_downloaded_media(output_dir, info, "mp4")
+            if existing:
+                print(f"Reusing existing video: {existing}")
+                return existing
         ydl_opts = {
             'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
@@ -492,24 +424,19 @@ def download_video(youtube_url: str, output_dir: str) -> Optional[str]:
             'no_warnings': False,
             'cookiesfrombrowser': ('chrome',),
             'remote_components': ['ejs:github'],
+            # yt-dlp defaults to deno only; enable node so the n-challenge
+            # can be solved on machines without deno installed
+            'js_runtimes': {'deno': {}, 'node': {}},
         }
-        os.makedirs(output_dir, exist_ok=True)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(youtube_url, download=True)
         if not info:
             print("Failed to download video.")
             return None
-        title = sanitize_title(info.get('title', ''))
-        expected_mp4 = os.path.join(output_dir, f"{title}.mp4")
-        if os.path.exists(expected_mp4):
-            return expected_mp4
-        # Fallback: search for any mp4 file
-        for file in os.listdir(output_dir):
-            if file.endswith('.mp4'):
-                mp4_file = os.path.join(output_dir, file)
-                print(f"Found video file: {mp4_file}")
-                return mp4_file
-        print(f"No mp4 file found in {output_dir}.")
+        mp4_path = resolve_downloaded_media(output_dir, info, "mp4", ydl)
+        if mp4_path:
+            return mp4_path
+        print(f"Expected mp4 not found in {output_dir} after download.")
         return None
     except Exception as e:
         print(f"Error downloading video: {str(e)}")
@@ -533,26 +460,6 @@ def clean_video_url(url: str) -> str:
             return f'https://www.youtube.com/watch?v={match.group(1)}'
     return url
 
-
-def sanitize_title(title: str) -> str:
-    """Sanitize a video title to match yt-dlp's filename sanitization.
-    yt-dlp replaces certain characters with fullwidth Unicode equivalents."""
-    # yt-dlp fullwidth character replacements (from yt_dlp.utils.sanitize_filename)
-    _FULLWIDTH_MAP = {
-        '"': '\uff02',   # ＂
-        '*': '\uff0a',   # ＊
-        '/': '\uff0f',   # ／
-        ':': '\uff1a',   # ：
-        '<': '\uff1c',   # ＜
-        '>': '\uff1e',   # ＞
-        '?': '\uff1f',   # ？
-        '\\': '\uff3c',  # ＼
-        '|': '\uff5c',   # ｜
-    }
-    sanitized = title
-    for char, replacement in _FULLWIDTH_MAP.items():
-        sanitized = sanitized.replace(char, replacement)
-    return sanitized
 
 # Supported local video extensions
 LOCAL_VIDEO_EXTENSIONS = {'.mp4', '.mov', '.mkv', '.avi', '.webm', '.flv', '.m4v', '.wmv'}
@@ -654,6 +561,9 @@ def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[d
             'no_warnings': False,
             'cookiesfrombrowser': ('chrome',),
             'remote_components': ['ejs:github'],
+            # yt-dlp defaults to deno only; enable node so the n-challenge
+            # can be solved on machines without deno installed
+            'js_runtimes': {'deno': {}, 'node': {}},
         }
 
         # If output_dir is provided, save WAV there, otherwise use temp file
@@ -662,29 +572,30 @@ def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[d
             # Use sanitized title for output filename
             ydl_opts['outtmpl'] = os.path.join(output_dir, '%(title)s.%(ext)s')
 
-            # Download once and return metadata from the same request
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(youtube_url, download=True)
-
+            # Reuse a previously downloaded WAV (slash encoding may differ from
+            # older runs). Metadata-only fetch is enough to know the title.
+            meta_opts = {k: v for k, v in ydl_opts.items() if k != 'postprocessors'}
+            meta_opts['quiet'] = True
+            meta_opts['no_warnings'] = True
+            with yt_dlp.YoutubeDL(meta_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=False)
             if not info:
                 print("Failed to extract video info.")
                 return None, None
+            existing = resolve_downloaded_media(output_dir, info, "wav")
+            if existing:
+                print(f"Reusing existing audio: {existing}")
+                return info, existing
 
-            # Sanitize title the same way yt-dlp does for filenames
-            title = sanitize_title(info.get('title', ''))
-            expected_wav = os.path.join(output_dir, f"{title}.wav")
-
-            if os.path.exists(expected_wav):
-                return info, expected_wav
-
-            # Fallback: look for any WAV file if the expected one isn't found
-            print(f"Expected WAV file {expected_wav} not found. Searching for any WAV file in {output_dir}...")
-            for file in os.listdir(output_dir):
-                if file.endswith('.wav'):
-                    wav_file = os.path.join(output_dir, file)
-                    print(f"Found WAV file: {wav_file}")
-                    return info, wav_file
-            print(f"No WAV file found in {output_dir}.")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(youtube_url, download=True)
+            if not info:
+                print("Failed to extract video info.")
+                return None, None
+            wav_path = resolve_downloaded_media(output_dir, info, "wav", ydl)
+            if wav_path:
+                return info, wav_path
+            print(f"Expected WAV file not found in {output_dir} after download.")
             return None, None
         else:
             # Use temporary file
@@ -696,8 +607,8 @@ def get_video_info(youtube_url: str, output_dir: str = None) -> Tuple[Optional[d
         print(f"Error downloading video: {str(e)}")
         return None, None
 
-def process_audio_features(audio_data: np.ndarray, sample_rate: int) -> list[mx.array]:
-    """Process audio data into features using MLX"""
+def process_audio_features(audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Convert audio to 16 kHz mono float32 for mlx-whisper."""
     # Handle different audio channel configurations
     if len(audio_data.shape) == 1:
         # Already mono
@@ -724,26 +635,17 @@ def process_audio_features(audio_data: np.ndarray, sample_rate: int) -> list[mx.
         else:
             mono_audio = mono_audio.astype(np.float32)
     # Ensure we're working with float32
-    mono_audio = mono_audio.astype(np.float32)
+    mono_audio = mono_audio.astype(np.float32, copy=False)
 
     # Resample to 16kHz if needed
-    if sample_rate != 16000:
-        # Calculate ratio for resampling
-        ratio = 16000 / sample_rate
+    if sample_rate != WHISPER_SAMPLE_RATE:
+        ratio = WHISPER_SAMPLE_RATE / sample_rate
         new_length = int(len(mono_audio) * ratio)
         indices = np.linspace(0, len(mono_audio) - 1, new_length)
         mono_audio = np.interp(indices, np.arange(len(mono_audio)), mono_audio)
+        mono_audio = mono_audio.astype(np.float32)
 
-    # Split audio into 30-second chunks (16000 samples/sec * 30 sec = 480000 samples)
-    chunk_size = 480000
-    audio_chunks = []
-    for i in range(0, len(mono_audio), chunk_size):
-        chunk = mono_audio[i:i + chunk_size]
-        # Pad last chunk if needed
-        if len(chunk) < chunk_size:
-            chunk = np.pad(chunk, (0, chunk_size - len(chunk)))
-        audio_chunks.append(mx.array(chunk))
-    return audio_chunks
+    return np.ascontiguousarray(mono_audio, dtype=np.float32)
 
 def process_audio(audio_path: str) -> Tuple[str, dict]:
     """Process audio file using MLX and return a summary of its characteristics and detailed metrics"""
@@ -796,40 +698,26 @@ def process_audio(audio_path: str) -> Tuple[str, dict]:
         print(f"Error processing audio: {str(e)}")
         return "", {}
 
-def transcribe_audio(audio_features: list[mx.array]) -> str:
-    """Transcribe audio using Whisper MLX"""
+def transcribe_audio(audio_features: np.ndarray) -> str:
+    """Transcribe a 16 kHz mono waveform with mlx-whisper on Metal."""
+    if audio_features is None or np.size(audio_features) == 0:
+        return ""
     transcriber = AudioTranscriber.get_instance()
-    transcriptions = []
-    total_chunks = len(audio_features)
-    print(f"\nProcessing {total_chunks} audio chunks...")
+    duration = np.size(audio_features) / WHISPER_SAMPLE_RATE
+    print(f"\nTranscribing {duration:.1f}s with mlx-whisper (Metal)...")
     print("-" * 50)
-    for i, chunk in enumerate(audio_features, 1):
-        print(f"\rTranscribing chunk {i}/{total_chunks}... ", end="")
-        trans = transcriber.transcribe(chunk)
-        if trans:
-            # Clean up the transcription
-            trans = trans.strip()
-            # Remove leading/trailing quotes and periods
-            trans = trans.strip('".')
-            # Remove any duplicate spaces
-            trans = ' '.join(trans.split())
-            if trans:
-                transcriptions.append(trans)
-        # Show progress percentage
-        progress = (i / total_chunks) * 100
-        print(f"[{progress:3.0f}%]", end="")
-        
-        # Clean up chunk after processing to free memory
-        del chunk
-        if i % 5 == 0:  # Periodic garbage collection every 5 chunks
-            gc.collect()
-    
-    print("\n" + "-" * 50)
-    # Join transcriptions with proper spacing and punctuation
-    full_transcript = ". ".join(t for t in transcriptions if t)
-    if full_transcript:
-        full_transcript += "."
-    return full_transcript
+    try:
+        trans = transcriber.transcribe(audio_features, verbose=False)
+    except Exception as e:
+        print(f"Error in transcription: {e}")
+        return ""
+    if not trans:
+        return ""
+    trans = trans.strip().strip('".')
+    trans = " ".join(trans.split())
+    if trans and not trans.endswith((".", "!", "?")):
+        trans += "."
+    return trans
 
 def get_chunk_speaker(chunk_index: int, chunk_duration: float, segments: list) -> str:
     """Determine which speaker has the most time in a given chunk
@@ -999,6 +887,9 @@ def extract_playlist_info(playlist_url: str) -> dict:
         'no_warnings': True,
         'cookiesfrombrowser': ('chrome',),
         'remote_components': ['ejs:github'],
+        # yt-dlp defaults to deno only; enable node so the n-challenge
+        # can be solved on machines without deno installed
+        'js_runtimes': {'deno': {}, 'node': {}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(playlist_url, download=False)
@@ -1022,7 +913,7 @@ class State(TypedDict):
     video_path: Optional[str]
     audio_analysis: Optional[str]
     audio_metrics: Optional[dict]
-    audio_features: Optional[List[mx.array]]
+    audio_features: Optional[np.ndarray]
     transcript: Optional[str]
     video_transcripts: Annotated[List[dict], operator.add]
     # Diarization fields
@@ -1041,6 +932,9 @@ def extract_radio_mix_videos(url: str) -> list:
         'noplaylist': False,  # Allow playlist extraction
         'cookiesfrombrowser': ('chrome',),
         'remote_components': ['ejs:github'],
+        # yt-dlp defaults to deno only; enable node so the n-challenge
+        # can be solved on machines without deno installed
+        'js_runtimes': {'deno': {}, 'node': {}},
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
@@ -1053,6 +947,10 @@ def extract_radio_mix_videos(url: str) -> list:
     return []
 
 def start_node(state: State) -> dict:
+    # Already resolved in main() so the recursion limit can scale with playlist size
+    if state.get("video_urls"):
+        return {}
+
     url = state["url"]
 
     # Handle local file/folder input
@@ -1122,7 +1020,17 @@ def start_node(state: State) -> dict:
             playlist_info = extract_playlist_info(url)
             if not playlist_info:
                 raise ValueError("Could not fetch playlist information")
-            video_urls = [(entry.get('url'), entry.get('title', 'unknown')) for entry in playlist_info.get('entries', [])]
+            video_urls = []
+            for entry in playlist_info.get('entries', []) or []:
+                if not entry:
+                    continue
+                entry_id = entry.get('id')
+                entry_url = entry.get('url') or (
+                    f"https://www.youtube.com/watch?v={entry_id}" if entry_id else None
+                )
+                if not entry_url:
+                    continue
+                video_urls.append((entry_url, entry.get('title', 'unknown')))
             playlist_title = playlist_info.get('title', 'playlist').replace('/', '_')
             output_dir = os.path.join('output', playlist_title)
             os.makedirs(output_dir, exist_ok=True)
@@ -1154,11 +1062,6 @@ def set_current(state: State) -> dict:
     
     # Clean up previous video's data if this isn't the first video
     if index > 0:
-        # Explicitly delete large objects from previous iteration
-        if state.get("audio_features"):
-            for feature in state["audio_features"]:
-                del feature
-        # Force garbage collection between videos
         gc.collect()
     
     url, title = urls[index]
@@ -1190,24 +1093,33 @@ def print_progress(state: State) -> dict:
     return {}
 
 def check_already_processed(state: State) -> dict:
-    """Check if video has already been processed by looking for output files"""
-    if not state["current_video_title"] or state["current_video_title"] == 'unknown':
-        # Can't check without title, proceed with processing
+    """Skip when a valid transcript already exists for this video.
+
+    Playlist titles often differ from the downloaded video title, so we look up
+    by YouTube video id (or local path) as well as by filename.
+    """
+    title = state.get("current_video_title")
+    url = state.get("current_video_url")
+    lookup_title = title if title and title != "unknown" else None
+    json_path, txt_path = find_existing_transcript(state["output_dir"], title=lookup_title, url=url)
+
+    if json_path and not transcript_audio_matches(json_path):
+        print("  ⚠️  Existing transcript points at a different audio file - will reprocess")
+        quarantine_output_files(
+            state["output_dir"],
+            [json_path, txt_path],
+            "transcript/audio filename mismatch",
+        )
         return {}
-    
-    # Sanitize title the same way yt-dlp and save_node do
-    title = sanitize_title(state["current_video_title"])
-    json_path = os.path.join(state["output_dir"], f"{title}.json")
-    txt_path = os.path.join(state["output_dir"], f"{title}.txt")
-    
-    # Check if either output file exists
-    if os.path.exists(json_path) or os.path.exists(txt_path):
+
+    if json_path or txt_path:
         print("  ⏭️  Already processed - skipping")
         print()
         # Mark as processed by setting transcript to a marker
         # This will cause save_node to skip file writing but still increment counter
-        return {"video_info": {"title": title}, "transcript": "ALREADY_PROCESSED"}
-    
+        saved_title = sanitize_title(title) if title else os.path.splitext(os.path.basename(json_path or txt_path))[0]
+        return {"video_info": {"title": saved_title}, "transcript": "ALREADY_PROCESSED"}
+
     return {}
 
 def get_video_info_node(state: State) -> dict:
@@ -1219,6 +1131,20 @@ def get_video_info_node(state: State) -> dict:
             return {"video_info": None, "audio_path": None, "video_path": None, "transcript": None}
         # For local files, the original video file IS the video_path
         video_path = state["current_video_url"] if state.get("save_video") else None
+        json_path, txt_path = find_existing_transcript(
+            state["output_dir"],
+            title=info.get("title"),
+            url=state.get("current_video_url"),
+        )
+        if json_path and transcript_audio_matches(json_path):
+            print("  ⏭️  Already processed - skipping")
+            print()
+            return {
+                "video_info": info,
+                "audio_path": audio_path,
+                "video_path": video_path,
+                "transcript": "ALREADY_PROCESSED",
+            }
         if not state.get("audio_only"):
             print("\nGenerating transcript...")
         else:
@@ -1229,11 +1155,36 @@ def get_video_info_node(state: State) -> dict:
     if not info or not audio_path:
         print("✗ Error processing video: Could not fetch video information and audio")
         return {"video_info": None, "audio_path": None, "video_path": None, "transcript": None}
+
+    # Playlist titles often differ from the real video title; skip here once we know it.
+    json_path, txt_path = find_existing_transcript(
+        state["output_dir"],
+        title=info.get("title"),
+        url=state.get("current_video_url") or info.get("webpage_url") or info.get("original_url"),
+    )
+    if json_path and not transcript_audio_matches(json_path):
+        print("  ⚠️  Existing transcript points at a different audio file - will reprocess")
+        quarantine_output_files(
+            state["output_dir"],
+            [json_path, txt_path],
+            "transcript/audio filename mismatch",
+        )
+        json_path = None
+    if json_path or txt_path:
+        print("  ⏭️  Already processed - skipping")
+        print()
+        return {
+            "video_info": info,
+            "audio_path": audio_path,
+            "video_path": None,
+            "transcript": "ALREADY_PROCESSED",
+        }
+
     # Download video mp4 if requested
     video_path = None
     if state.get("save_video") and state.get("video_dir"):
         print("\nDownloading video (mp4)...")
-        video_path = download_video(state["current_video_url"], state["video_dir"])
+        video_path = download_video(state["current_video_url"], state["video_dir"], info=info)
         if video_path:
             print(f"✓ Video saved: {video_path}")
         else:
@@ -1345,7 +1296,8 @@ def transcribe_node(state: State) -> dict:
         return {"transcript": transcript}
 
     # Whisper backend (default)
-    if not state.get("audio_features"):
+    audio_features = state.get("audio_features")
+    if audio_features is None or np.size(audio_features) == 0:
         return {"transcript": None, "pascal_segments": state.get("pascal_segments")}
 
     # Check if we have Pascal segments to transcribe individually
@@ -1376,20 +1328,20 @@ def transcribe_node(state: State) -> dict:
                 audio_data = audio_data.astype(np.float32) / 2147483648.0
 
             # Resample to 16kHz if needed
-            if sample_rate != 16000:
-                ratio = 16000 / sample_rate
+            if sample_rate != WHISPER_SAMPLE_RATE:
+                ratio = WHISPER_SAMPLE_RATE / sample_rate
                 new_length = int(len(audio_data) * ratio)
                 indices = np.linspace(0, len(audio_data) - 1, new_length)
                 audio_data = np.interp(indices, np.arange(len(audio_data)), audio_data)
 
-            # Pad to 30 seconds for Whisper (it needs fixed input size)
-            chunk_size = 480000
-            if len(audio_data) < chunk_size:
-                audio_data = np.pad(audio_data, (0, chunk_size - len(audio_data)))
-
-            # Convert to MLX array and transcribe
-            chunk = mx.array(audio_data[:chunk_size].astype(np.float32))
-            transcript = transcriber.transcribe(chunk)
+            try:
+                transcript = transcriber.transcribe(
+                    audio_data.astype(np.float32, copy=False),
+                    verbose=None,
+                )
+            except Exception as e:
+                print(f"Error in transcription: {e}")
+                transcript = ""
 
             # Clean up transcription
             if transcript:
@@ -1436,10 +1388,6 @@ def save_node(state: State) -> dict:
         error_msg = "✗ Error processing video: No video info"
         print(error_msg)
 
-        # Clean up even on error
-        if state.get("audio_features"):
-            for feature in state["audio_features"]:
-                del feature
         gc.collect()
 
         return {"current_index": state["current_index"] + 1, "video_transcripts": []}
@@ -1450,15 +1398,15 @@ def save_node(state: State) -> dict:
         error_msg = "✗ Error processing video: Transcription failed"
         print(error_msg)
 
-        # Clean up even on error
-        if state.get("audio_features"):
-            for feature in state["audio_features"]:
-                del feature
         gc.collect()
 
         return {"current_index": state["current_index"] + 1, "video_transcripts": []}
 
-    title = sanitize_title(state["video_info"].get('title', ''))
+    # Keep json/txt stems aligned with the actual WAV on disk
+    if state.get("audio_path"):
+        title = os.path.splitext(os.path.basename(state["audio_path"]))[0]
+    else:
+        title = sanitize_title(state["video_info"].get('title', ''))
     description = state["video_info"].get('description', '')
     duration = state["video_info"].get('duration', 0)
     view_count = state["video_info"].get('view_count', 0)
@@ -1594,10 +1542,6 @@ def save_node(state: State) -> dict:
             print("⚠ No transcript generated")
         print()
 
-    # Clean up large objects after saving
-    if state.get("audio_features"):
-        for feature in state["audio_features"]:
-            del feature
     gc.collect()
 
     return {"video_transcripts": [transcript_dict], "current_index": state["current_index"] + 1}
@@ -1618,7 +1562,7 @@ def finalize_node(state: State) -> dict:
         print(f"  Output: {state['output_dir']}/segments/")
 
     # Clean up transcriber singletons at the end
-    AudioTranscriber.cleanup()
+    AudioTranscriber.cleanup_singleton()
     VoxtralTranscriber.cleanup()
     # Clean up diarizer singleton
     DiarizerManager.cleanup()
@@ -1662,13 +1606,19 @@ def skip_condition(state: State):
 
 graph.add_conditional_edges("check_processed", skip_condition, {"process": "get_video_info", "skip": "save"})
 
-# Conditional edge: skip transcription if audio_only mode
+# Conditional edge: skip transcription if audio_only mode or already processed
 def audio_only_condition(state: State):
+    if state.get("transcript") == "ALREADY_PROCESSED":
+        return "skip"
     if state.get("audio_only"):
         return "audio_only"
     return "transcribe"
 
-graph.add_conditional_edges("get_video_info", audio_only_condition, {"transcribe": "process_analysis", "audio_only": "save"})
+graph.add_conditional_edges(
+    "get_video_info",
+    audio_only_condition,
+    {"transcribe": "process_analysis", "audio_only": "save", "skip": "save"},
+)
 
 # Conditional edge: voxtral skips feature extraction and diarization
 def backend_condition(state: State):
@@ -1683,8 +1633,7 @@ graph.add_edge("transcribe", "save")
 graph.add_edge("save", "set_current")
 graph.add_edge("finalize", END)
 
-# Compile with high recursion limit for large playlists
-# Each video takes ~8 steps through the graph, so 72 videos = 576+ steps
+# Recursion limit is set per invoke from playlist size (see recursion_limit_for)
 app = graph.compile()
 
 def main():
@@ -1831,8 +1780,14 @@ Examples:
         "pascal_segments": None,
         "transcription_backend": transcription_backend
     }
-    # Set recursion limit high enough for large playlists (72 videos × ~8 steps = ~600)
-    app.invoke(initial_state, {"recursion_limit": 1000})
+    # Resolve the playlist first so the graph recursion limit can scale with size.
+    # Full pipeline is ~9 node visits per video; a fixed 1000 cap dies around video 111.
+    setup = start_node(initial_state)
+    run_state = {**initial_state, **setup}
+    n_videos = len(run_state.get("video_urls") or [])
+    limit = recursion_limit_for(n_videos)
+    print(f"Graph recursion_limit={limit} for {n_videos} video(s)")
+    app.invoke(run_state, {"recursion_limit": limit})
 
 if __name__ == '__main__':
     main()

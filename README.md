@@ -48,7 +48,7 @@ flowchart TD
   - **Mode 2** — Audio + Transcription (local Whisper, default)
   - **Mode 3** — Speaker diarization + TTS dataset preparation (using pyannote.audio)
   - **Mode 4** — Audio + Voxtral transcription (using Voxtral-Mini-3B via MLX)
-- **Apple Silicon Optimized**: Leverages MLX and Metal Performance Shaders (MPS) for accelerated inference on M1/M2/M3 Macs
+- **Apple Silicon Optimized**: Whisper runs on the Apple GPU via mlx-whisper (Metal). Demucs and pyannote still use PyTorch MPS.
 - **YouTube Premium Support**: Uses browser cookies for authenticated downloads (highest available audio quality)
 - **TTS Dataset Utilities**: Build Qwen3-TTS fine-tuning datasets from diarized segments or raw WAV recordings
 - **OpenAI API Variant**: Alternative transcription backend using OpenAI's Whisper API instead of local models
@@ -86,9 +86,9 @@ flowchart TD
    conda install -c conda-forge streamlit yt-dlp numpy scipy
    
    # Install MLX for Apple Silicon acceleration
-   pip install mlx
+   pip install mlx mlx-whisper
    
-   # Install transformers with MLX support
+   # Install transformers (diarization / Demucs still use PyTorch)
    pip install transformers[torch]
    ```
 
@@ -127,6 +127,71 @@ python src/main_langgraph.py -u "https://youtube.com/watch?v=..." -m 4
 python src/main_langgraph.py -f /path/to/video.mp4
 python src/main_langgraph.py -d /path/to/videos/
 ```
+
+### Transcribe a local M4A file
+
+Use the focused M4A CLI when you already have an audio file and only need its
+transcription. The transcript is printed to stdout:
+
+```bash
+python src/transcribe_m4a.py /path/to/audio.m4a
+```
+
+### Drop-folder MoM pipeline (daily use)
+
+For meeting audio (`.m4a`) you want transcribed **and** turned into Minutes of
+Meeting markdown via local oMLX:
+
+1. Drop files into `~/Desktop/AudioToMoM/`
+2. Start oMLX with your DeepSeek model loaded
+3. Run (no file arguments needed):
+
+```bash
+./run_mom_inbox.sh
+# or:
+conda run -n youtube python src/mom_from_audio.py
+```
+
+Outputs land in `~/Desktop/AudioToMoM/output/`:
+
+- `*.transcript.txt` — raw Whisper transcript  
+- `*.mom.md` — Minutes of Meeting with action items  
+
+**Skip already-processed audio:** content is hashed (SHA-256). The same file is
+never transcribed or MoM’d twice, even if you rename it. State lives in
+`~/Desktop/AudioToMoM/.processed.json`. Use `--force` to re-run.
+
+**Memory order:** all Whisper transcriptions first (one model load), then all
+oMLX MoMs — so Whisper and DeepSeek are not loaded at the same time.
+
+| Env / flag | Default | Purpose |
+| --- | --- | --- |
+| `MOM_INBOX_DIR` / `--inbox` | `~/Desktop/AudioToMoM` | Drop folder |
+| `OMLX_BASE_URL` / `--omlx-base-url` | `http://127.0.0.1:8000/v1` | oMLX OpenAI-compatible API |
+| `OMLX_MODEL` / `--omlx-model` | `DeepSeek-V4-Flash-0731-MXFP4-MLX` | Model id as listed by oMLX |
+| `OMLX_API_KEY` / `--omlx-api-key` | from `~/.omlx/settings.json` | Bearer token for oMLX |
+| `--skip-mom` | off | Transcript only |
+| `--force` | off | Reprocess despite registry |
+
+MoM system prompt: `prompts/mom_system.md` (edit freely).
+
+Write the transcript to a text file instead:
+
+```bash
+python src/transcribe_m4a.py /path/to/audio.m4a --output transcript.txt
+```
+
+Or use the setup wrapper to create/reuse `.venv`, install the focused Python
+dependencies, ensure FFmpeg is available, and run the transcription. The
+wrapper requires Python 3.9 or newer:
+
+```bash
+./setup_and_run_audio_transcription.sh /path/to/audio.m4a --output transcript.txt
+```
+
+The command uses `mlx-community/whisper-large-v3-turbo` via mlx-whisper on
+the Apple GPU (Metal), defaults to English (matching the main pipeline), and
+accepts `--language` for other Whisper languages.
 
 ### OpenAI API Variant
 
@@ -177,16 +242,16 @@ For playlists, a subdirectory with the playlist name is created containing all v
 
 ## Models
 
-- **`openai/whisper-large-v3-turbo`** — Local Whisper transcription (modes 2, 3, and TTS dataset builder)
+- **`mlx-community/whisper-large-v3-turbo`** — Local Whisper transcription via mlx-whisper on Metal (modes 2, 3, and TTS dataset builder)
 - **`mistralai/Voxtral-Mini-3B-2507`** — Voxtral transcription via MLX (mode 4)
 - **`pyannote/speaker-diarization-3.1`** — Speaker diarization (mode 3)
 - **`whisper-1`** — OpenAI API transcription (OpenAI variant only)
 
 ## Performance Notes
 
-- The application is optimized for Apple Silicon (M1/M2) using MLX for accelerated inference
+- Whisper STT uses mlx-whisper on the Apple GPU (Metal), not PyTorch CPU/MPS
 - Processing time depends on video length and system performance
-- For long videos, the audio is automatically split into 30-second chunks for processing
+- Long audio is windowed inside mlx-whisper (with previous-text conditioning)
 
 ## Troubleshooting
 
@@ -216,7 +281,7 @@ limitations under the License.
 
 ## Acknowledgments
 
-- [OpenAI Whisper](https://github.com/openai/whisper) for the speech recognition model
+- [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) for Metal Whisper inference
 - [Voxtral](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507) for MLX-based transcription
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) for speaker diarization
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) for YouTube video downloading
